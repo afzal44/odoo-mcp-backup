@@ -1,0 +1,13 @@
+# Odoo Functional MCP backup snapshot
+# generated 2026-07-13 10:46 UTC
+# size: 52K
+
+./MANIFEST.txt
+./README.md
+./demo.py
+./functional_layer.py
+./mcp_client_config.example.json
+./mcp_server.py
+./odoo_client.py
+./requirements.txt
+./test_mcp.py
