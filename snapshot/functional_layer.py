@@ -84,6 +84,259 @@ class FunctionalAgent:
         rec["_ok"] = rec["amount_total"] > 0
         return rec
 
+    # --- SALES INVOICE  (credit terms + GST-aware) --------------------------
+    def find_payment_term(self, term):
+        """Resolve an account.payment.term by id or name. Returns id or None.
+        Falls back to a contains match so '30' finds '30 Days'."""
+        if isinstance(term, int):
+            return term
+        found = self.c.search("account.payment.term", [("name", "=", term)], limit=1)
+        if not found:
+            found = self.c.search("account.payment.term", [("name", "ilike", term)], limit=1)
+        return found[0] if found else None
+
+    def _resolve_sale_order(self, order):
+        if isinstance(order, int):
+            return order
+        found = self.c.search("sale.order", [("name", "=", order)], limit=1)
+        if not found:
+            raise ValueError(f"Sale order not found: {order!r}")
+        return found[0]
+
+    def invoice_sale(self, order, payment_term=None, auto_confirm=True):
+        """
+        Create AND post a customer invoice for an existing sale order, applying an
+        optional payment term (credit period) so the receivable gets a due date.
+
+        order        : sale.order name (e.g. 'S00007') or id.
+        payment_term : account.payment.term name/id (e.g. '30 Days'); optional.
+                       Sets the credit due date (invoice_date_due) on the invoice.
+        auto_confirm : confirm the SO first if it's still a draft/quotation
+                       (invoicing requires a confirmed order).
+
+        WHY the wizard (not _create_invoices): sale.order._create_invoices is a
+        PRIVATE method (leading underscore) and Odoo refuses to call it over
+        JSON-RPC. The public, UI-equivalent path is the sale.advance.payment.inv
+        wizard with the sale order in the context's active_ids.
+
+        Taxes are NOT hand-set: the invoice inherits the SO lines' computed taxes,
+        so wherever GST (CGST/SGST/IGST) is configured it flows through and is
+        reported back in `taxes`, split by component.
+        """
+        so_id = self._resolve_sale_order(order)
+        rec = self.c.read("sale.order", [so_id],
+                          ["name", "state", "invoice_status", "invoice_ids"])[0]
+
+        # 1. ensure confirmed (draft/sent orders can't be invoiced)
+        if rec["state"] in ("draft", "sent"):
+            if not auto_confirm:
+                return {"_ok": False,
+                        "error": f"Order {rec['name']} is '{rec['state']}'; "
+                                 f"confirm it first or pass auto_confirm=True."}
+            self.c.call("sale.order", "action_confirm", [so_id])
+
+        # 2. apply the credit term BEFORE invoicing so it flows onto the invoice
+        if payment_term is not None:
+            term_id = self.find_payment_term(payment_term)
+            if term_id is None:
+                return {"_ok": False, "error": f"Payment term not found: {payment_term!r}"}
+            self.c.write("sale.order", [so_id], {"payment_term_id": term_id})
+
+        # 3. anything to invoice?
+        rec = self.c.read("sale.order", [so_id], ["name", "invoice_status", "invoice_ids"])[0]
+        before_inv = set(rec["invoice_ids"])
+        if rec["invoice_status"] != "to invoice":
+            if before_inv:
+                return {"_ok": True, "note": f"Order {rec['name']} already invoiced.",
+                        "order": rec["name"], "invoices": self._summarize_invoices(list(before_inv))}
+            return {"_ok": False,
+                    "error": f"Order {rec['name']} has invoice_status="
+                             f"'{rec['invoice_status']}'; nothing to invoice."}
+
+        # 4. public wizard flow -> create the draft invoice(s)
+        ctx = {"active_model": "sale.order", "active_ids": [so_id], "active_id": so_id}
+        wiz_id = self.c.execute_kw("sale.advance.payment.inv", "create",
+                                   [{"advance_payment_method": "delivered"}], {"context": ctx})
+        self.c.execute_kw("sale.advance.payment.inv", "create_invoices", [[wiz_id]], {"context": ctx})
+
+        # 5. post the newly-created invoice(s) via the real workflow method
+        rec = self.c.read("sale.order", [so_id], ["name", "invoice_ids"])[0]
+        new_inv = [i for i in rec["invoice_ids"] if i not in before_inv]
+        if not new_inv:
+            return {"_ok": False, "error": "Invoice creation returned no new invoice."}
+        self.c.call("account.move", "action_post", new_inv)
+
+        # 6. read back + verify (posted, non-zero, and a due date actually landed)
+        summary = self._summarize_invoices(new_inv)
+        posted_ok = all(m["state"] == "posted" and m["amount_total"] > 0
+                        and m["invoice_date_due"] for m in summary)
+        return {"_ok": posted_ok, "order": rec["name"], "invoices": summary}
+
+    def _summarize_invoices(self, inv_ids):
+        moves = self.c.read("account.move", inv_ids,
+                            ["name", "state", "move_type", "amount_untaxed", "amount_tax",
+                             "amount_total", "amount_residual", "invoice_date",
+                             "invoice_date_due", "invoice_payment_term_id"])
+        # per-component tax split: CGST/SGST/IGST appear as separate lines when
+        # l10n_in is installed, so the GST breakdown is visible without guessing.
+        for m in moves:
+            tax_lines = self.c.search_read(
+                "account.move.line",
+                [("move_id", "=", m["id"]), ("tax_line_id", "!=", False)],
+                ["name", "tax_line_id", "balance"])
+            m["taxes"] = [{"name": t["name"] or (t["tax_line_id"] and t["tax_line_id"][1]),
+                           "amount": abs(t["balance"])} for t in tax_lines]
+        return moves
+
+    # --- STOCK / DELIVERY  (FEFO lot selection)  ----------------------------
+    # The delivery leg of a sale: reserve stock and validate the outgoing picking.
+    # With a lot-tracked product whose category forces the FEFO removal strategy,
+    # action_assign reserves the earliest-EXPIRY lot first (First Expiry First Out),
+    # exactly what perishable agro-inputs (pesticides, etc.) need. We read the
+    # picked lot back so the caller can verify which batch actually shipped.
+    FEFO_CATEGORY = "Agro FEFO"
+
+    def _stock_location(self):
+        wh = self.c.search_read("stock.warehouse", [], ["lot_stock_id"], limit=1)
+        if not wh:
+            raise ValueError("No warehouse configured (is the 'stock' module installed?)")
+        return wh[0]["lot_stock_id"][0]
+
+    def ensure_fefo_product(self, name, list_price=0.0, use_expiration=True):
+        """Ensure a STORABLE, LOT-tracked product in the FEFO-forced category.
+        Idempotent (matches by name). Returns product.product id. A product must be
+        storable + tracking='lot' for lot/expiry delivery; the category forces FEFO."""
+        cat = self.c.search("product.category", [("name", "=", self.FEFO_CATEGORY)], limit=1)
+        if not cat:
+            fefo = self.c.search("product.removal", [("method", "=", "fefo")], limit=1)
+            cat = [self.c.create("product.category",
+                                 {"name": self.FEFO_CATEGORY,
+                                  "removal_strategy_id": fefo[0] if fefo else False})]
+        vals = {"is_storable": True, "tracking": "lot",
+                "use_expiration_date": use_expiration, "categ_id": cat[0], "sale_ok": True}
+        found = self.c.search("product.product", [("name", "=", name)], limit=1)
+        if found:
+            self.c.write("product.product", found, vals)
+            return found[0]
+        vals.update({"name": name, "type": "consu", "list_price": list_price})
+        return self.c.create("product.product", vals)
+
+    @staticmethod
+    def _as_datetime(d):
+        """Accept 'YYYY-MM-DD' or a full datetime string; return a datetime string."""
+        if not d:
+            return None
+        return d if len(d) > 10 else d + " 00:00:00"
+
+    def add_lot_stock(self, product, lot, qty, expiration_date=None, location=None):
+        """Put on-hand stock of a lot-tracked product in via an inventory adjustment,
+        creating the lot (with an optional expiry date) if needed. FEFO orders by
+        that expiry. Use this to seed/open/receive lot stock so a sale can be
+        delivered against it.
+
+        product          : product name (auto-configured for FEFO) or id
+        lot              : lot/batch name (str)
+        qty              : quantity to set on hand (float)
+        expiration_date  : 'YYYY-MM-DD' (or full datetime); optional but drives FEFO
+        """
+        pid = product if isinstance(product, int) else self.ensure_fefo_product(product)
+        loc = location or self._stock_location()
+        exp = self._as_datetime(expiration_date)
+
+        lot_ids = self.c.search("stock.lot", [("name", "=", lot), ("product_id", "=", pid)], limit=1)
+        if lot_ids:
+            if exp:
+                self.c.write("stock.lot", lot_ids, {"expiration_date": exp})
+            lot_id = lot_ids[0]
+        else:
+            lvals = {"name": lot, "product_id": pid}
+            if exp:
+                lvals["expiration_date"] = exp
+            lot_id = self.c.create("stock.lot", lvals)
+
+        # Direct quant writes require inventory_mode; action_apply_inventory commits
+        # the counted qty as the new on-hand (and returns an empty envelope on success).
+        ctx = {"inventory_mode": True}
+        q = self.c.search("stock.quant",
+                          [("product_id", "=", pid), ("location_id", "=", loc), ("lot_id", "=", lot_id)],
+                          limit=1)
+        if q:
+            self.c.execute_kw("stock.quant", "write", [q, {"inventory_quantity": qty}], {"context": ctx})
+        else:
+            q = [self.c.execute_kw("stock.quant", "create",
+                                   [{"product_id": pid, "location_id": loc,
+                                     "lot_id": lot_id, "inventory_quantity": qty}], {"context": ctx})]
+        self.c.execute_kw("stock.quant", "action_apply_inventory", [q], {"context": ctx})
+
+        onhand = self.c.search_read("stock.quant", [("id", "in", q)],
+                                    ["lot_id", "quantity", "removal_date"])
+        return {"_ok": bool(onhand) and onhand[0]["quantity"] == qty,
+                "product_id": pid, "lot_id": lot_id, "onhand": onhand}
+
+    def deliver_sale(self, order, auto_confirm=True):
+        """Reserve (FEFO) and validate the delivery picking(s) for a sale order, then
+        read back which lot(s) actually shipped.
+
+        Confirming a sale of a storable product auto-creates the outgoing picking;
+        we confirm first if needed, action_assign (which picks the earliest-expiry
+        lot under FEFO), mark the move lines picked, and button_validate with
+        skip_backorder so a short-reserve doesn't spawn a backorder wizard.
+
+        Returns per-picking state and the picked lot + its expiry, so the caller can
+        verify the correct batch left stock. _ok is True only when every picking
+        reaches state 'done'.
+        """
+        so_id = self._resolve_sale_order(order)
+        rec = self.c.read("sale.order", [so_id], ["name", "state", "picking_ids"])[0]
+
+        if rec["state"] in ("draft", "sent"):
+            if not auto_confirm:
+                return {"_ok": False,
+                        "error": f"Order {rec['name']} is '{rec['state']}'; confirm it "
+                                 f"first or pass auto_confirm=True."}
+            self.c.call("sale.order", "action_confirm", [so_id])
+            rec = self.c.read("sale.order", [so_id], ["name", "state", "picking_ids"])[0]
+
+        pickings = rec["picking_ids"]
+        if not pickings:
+            return {"_ok": False,
+                    "error": f"Order {rec['name']} has no delivery picking. Is the product "
+                             f"storable (is_storable) and 'stock'/'sale_stock' installed?"}
+
+        results = []
+        for pick in pickings:
+            prec = self.c.read("stock.picking", [pick], ["state"])[0]
+            if prec["state"] not in ("done", "cancel"):
+                # reserve; FEFO resolves the lot(s) by earliest removal/expiry date
+                self.c.call("stock.picking", "action_assign", [pick])
+                mls = self.c.search("stock.move.line", [("picking_id", "=", pick)])
+                if mls:
+                    self.c.write("stock.move.line", mls, {"picked": True})
+                self.c.execute_kw("stock.picking", "button_validate", [[pick]],
+                                  {"context": {"skip_backorder": True, "skip_sms": True}})
+            results.append(self._summarize_picking(pick))
+
+        return {"_ok": all(r["state"] == "done" for r in results),
+                "order": rec["name"], "pickings": results}
+
+    def _summarize_picking(self, pick):
+        prec = self.c.read("stock.picking", [pick], ["name", "state", "scheduled_date"])[0]
+        lines = self.c.search_read("stock.move.line", [("picking_id", "=", pick)],
+                                   ["product_id", "lot_id", "quantity", "picked"])
+        # pull expiry from the lots (avoids assuming move-line has the field)
+        lot_ids = [l["lot_id"][0] for l in lines if l["lot_id"]]
+        exp = {}
+        if lot_ids:
+            for lt in self.c.read("stock.lot", lot_ids, ["expiration_date", "removal_date"]):
+                exp[lt["id"]] = lt
+        prec["moves"] = [{"product": l["product_id"] and l["product_id"][1],
+                          "lot": l["lot_id"] and l["lot_id"][1],
+                          "qty": l["quantity"], "picked": l["picked"],
+                          "expiration_date": (exp.get(l["lot_id"][0], {}).get("expiration_date")
+                                              if l["lot_id"] else None)}
+                         for l in lines]
+        return prec
+
     # --- PURCHASE ------------------------------------------------------------
     def record_purchase(self, vendor, lines, confirm=False):
         """

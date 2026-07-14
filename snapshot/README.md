@@ -38,8 +38,36 @@ Every new capability follows the same 5 steps (agreed 2026-07-13):
 5. **WRAP**  — add one `@mcp.tool()` block to `mcp_server.py` under a new
    `# CAPABILITY:` section.
 
-Tools shipped so far: `record_sale`, `record_purchase`, `find_partner`,
-`list_products`. Next up (Boss's example): document upload.
+Tools shipped so far (8): `record_sale`, `record_purchase`, `post_customer_invoice`,
+`stock_in_lot`, `deliver_sale`, `find_partner`, `list_products`, `list_payment_terms`.
+Next up: document upload, then real GST (`l10n_in`) taxes and pricing.
+
+**`post_customer_invoice`** (added 2026-07-14) — creates AND posts a customer
+invoice for an existing sale order, applying a payment term so the receivable gets
+a credit due date. Proven on mlrd (INV/2026/00002, 30-day term → due date set).
+Notes: `sale.order._create_invoices` is private/not RPC-callable, so it drives the
+public `sale.advance.payment.inv` wizard instead. Taxes flow from the SO lines, so
+GST CGST/SGST/IGST split appears automatically once `l10n_in` is installed (mlrd
+currently has only generic demo taxes). This closes part of the credit-sale
+`capability_gap` from the 2026-07-14 Agro Books work order; stock/FEFO remain.
+
+**`stock_in_lot` + `deliver_sale`** (added 2026-07-14) — the stock-delivery + FEFO
+lot/expiry half of the credit-sale gap. Required installing `stock`, `sale_stock`,
+`product_expiry` on mlrd. `stock_in_lot` puts on-hand stock of a lot-tracked product
+in via an inventory adjustment (auto-configuring the product as storable + lot-tracked
+in the "Agro FEFO" category, whose removal strategy is FEFO) with an optional expiry
+date. `deliver_sale` confirms the order (which auto-creates the delivery picking),
+reserves stock — FEFO picks the **earliest-expiry lot** — marks the move lines picked,
+and `button_validate`s with `skip_backorder`, then reads back the picked lot + its
+expiry. Proven on mlrd: two dated lots, sale of 3 → FEFO correctly shipped the
+earliest-expiry lot; picking `done`. Notes: direct `stock.quant` writes need
+`inventory_mode=True` context + `action_apply_inventory` (which returns an empty
+JSON-RPC envelope on success — `odoo_client._call` now tolerates a missing `result`).
+Odoo 19 stock shape: product `type='consu'` + `is_storable` + `tracking='lot'`; move
+line uses `quantity`/`lot_id`/`picked` (no `qty_done`/`reserved_uom_qty`). Typical
+chain: `stock_in_lot` → `record_sale` → `deliver_sale` → `post_customer_invoice`.
+Caveat: a fresh FEFO product is created with `list_price` 0 — set a price/pricelist
+before relying on the sale total.
 
 ## Connect an MCP client
 See `mcp_client_config.example.json`. It points the client at the venv Python +
@@ -69,7 +97,8 @@ follow the 5-step process above.
 ## Safety notes / decisions baked in
 - Runs as a **dedicated scoped user** `ai_agent` (uid 33 on mlrd), NOT admin.
   Groups: internal user + Sales Manager + Purchase Manager + Product Manager +
-  Invoicing. Scope the groups down further for prod.
+  Invoicing + Inventory Manager + Manage Lots/Serial (last two added 2026-07-14
+  for delivery/FEFO). Scope the groups down further for prod.
 - Auth via **API key** (works in place of password over JSON-RPC), stored 0600.
 - This Odoo 19 build enforces an **API-key max lifespan of 90 days** for
   non-`group_system` users — the scaffold key expires **2026-10-10**; regenerate

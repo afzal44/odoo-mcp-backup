@@ -74,8 +74,80 @@ def record_purchase(vendor: str, product: str, qty: float,
 
 
 # ============================================================================
+# CAPABILITY: customer invoice  (post GST invoice + credit terms)  (added 2026-07-14)
+# ============================================================================
+@mcp.tool()
+def post_customer_invoice(order: str, payment_term: str | None = None,
+                          auto_confirm: bool = True) -> dict:
+    """Create and POST a customer invoice for an existing sale order.
+
+    - order: the sale order name (e.g. 'S00007') or id.
+    - payment_term: optional credit term name (e.g. '30 Days', 'Immediate Payment');
+      it sets the invoice's due date (the receivable). Omit for the order/partner default.
+    - auto_confirm: confirm the quotation first if it is still a draft (invoicing
+      requires a confirmed order).
+
+    Taxes (including GST CGST/SGST/IGST wherever configured) flow from the order
+    lines and are returned split by component in `taxes`. Returns the invoice number,
+    state (should be 'posted'), totals, tax breakdown, and the credit due date
+    (invoice_date_due). Use record_sale first to create the order, then this to bill it."""
+    return _safe(lambda: agent().invoice_sale(order, payment_term=payment_term,
+                                              auto_confirm=auto_confirm))
+
+
+# ============================================================================
+# CAPABILITY: inventory  (seed/receive lot stock with expiry, for FEFO)  (added 2026-07-14)
+# ============================================================================
+@mcp.tool()
+def stock_in_lot(product: str, lot: str, qty: float,
+                 expiration_date: str | None = None) -> dict:
+    """Put on-hand stock of a LOT-tracked product in (opening/receipt via inventory
+    adjustment), creating the batch/lot with an optional expiry date.
+
+    - product: product name; it is auto-configured as storable + lot-tracked in the
+      FEFO category (so deliveries pick earliest-expiry first). Reused if it exists.
+    - lot: the batch/lot number (e.g. 'CONF-2406').
+    - qty: quantity to place on hand.
+    - expiration_date: 'YYYY-MM-DD' (drives FEFO ordering). Optional but recommended
+      for perishable agro-inputs.
+
+    Call this BEFORE record_sale/deliver_sale so there is stock (and a dated lot) to
+    ship. Returns the resulting on-hand quant with its computed removal date."""
+    return _safe(lambda: agent().add_lot_stock(product, lot, qty,
+                                               expiration_date=expiration_date))
+
+
+# ============================================================================
+# CAPABILITY: stock delivery  (reserve FEFO lot + validate picking)  (added 2026-07-14)
+# ============================================================================
+@mcp.tool()
+def deliver_sale(order: str, auto_confirm: bool = True) -> dict:
+    """Reserve stock and VALIDATE the delivery for a sale order, picking the
+    earliest-expiry lot (FEFO), then read back which lot(s) shipped.
+
+    - order: the sale order name (e.g. 'S00007') or id.
+    - auto_confirm: confirm the quotation first if still a draft (confirming a sale
+      of a storable product is what creates the delivery picking).
+
+    Requires the product to be storable + lot-tracked with stock on hand (use
+    stock_in_lot first). Returns per-picking state (should be 'done') and, per move,
+    the picked lot and its expiration date so you can verify the correct batch left
+    stock. Typical chain: stock_in_lot -> record_sale -> deliver_sale -> post_customer_invoice."""
+    return _safe(lambda: agent().deliver_sale(order, auto_confirm=auto_confirm))
+
+
+# ============================================================================
 # CAPABILITY: lookups (read-only helpers so the agent can resolve names)
 # ============================================================================
+@mcp.tool()
+def list_payment_terms(query: str = "") -> dict:
+    """List available payment (credit) terms, e.g. 'Immediate Payment', '30 Days'.
+    Read-only. Use before post_customer_invoice to pick a valid term name."""
+    def go():
+        domain = [("name", "ilike", query)] if query else []
+        rows = agent().c.search_read("account.payment.term", domain, ["id", "name"], limit=25)
+        return {"ok": True, "count": len(rows), "payment_terms": rows}
+    return _safe(go)
 @mcp.tool()
 def find_partner(name: str) -> dict:
     """Find contacts (customers/vendors) whose name matches. Read-only."""

@@ -43,7 +43,10 @@ class OdooClient:
             err = body["error"]
             data = err.get("data", {})
             raise OdooError(f"{data.get('name', err.get('message'))}: {data.get('message', '')}".strip())
-        return body["result"]
+        # Some Odoo action methods (e.g. stock.quant.action_apply_inventory) return
+        # an empty JSON-RPC envelope with no "result" key on success. Treat a missing
+        # result as None rather than raising KeyError.
+        return body.get("result")
 
     def login(self):
         self.uid = self._call("common", "authenticate", [self.db, self.username, self.password, {}])
