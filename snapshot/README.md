@@ -38,9 +38,26 @@ Every new capability follows the same 5 steps (agreed 2026-07-13):
 5. **WRAP**  — add one `@mcp.tool()` block to `mcp_server.py` under a new
    `# CAPABILITY:` section.
 
-Tools shipped so far (8): `record_sale`, `record_purchase`, `post_customer_invoice`,
-`stock_in_lot`, `deliver_sale`, `find_partner`, `list_products`, `list_payment_terms`.
-Next up: document upload, then real GST (`l10n_in`) taxes and pricing.
+Tools shipped so far (9): `record_sale`, `record_purchase`, `post_customer_invoice`,
+`stock_in_lot`, `deliver_sale`, `create_product`, `find_partner`, `list_products`,
+`list_payment_terms`.
+Next up: document upload, then pricing/pricelists.
+
+**`create_product`** (added 2026-07-14) — product master (`product.template`) with an
+HSN/SAC code, GST rate that resolves to real tax objects (intra-state → a GROUP tax
+splitting into CGST+SGST each rate/2; `interstate_gst=True` → single IGST), a base UoM,
+optional lot/serial tracking + expiry (lot+expiry ⇒ filed in the FEFO category so
+deliveries ship earliest-expiry first), and an optional pack/case UoM. Reads back and
+verifies HSN/tax/tracking landed. Required installing **`l10n_in`** on mlrd (for the real
+`l10n_in_hsn_code` field) and granting `ai_agent` the **Accounting Administrator** group
+(`account.group_account_manager`) so it can create `account.tax`. Proven over MCP; created
+`Amida 17.8% SL 250ml` (HSN 3808, GST 18% → CGST 9%+SGST 9%, lot+expiry). Odoo-19 gotchas:
+`uom.uom` is relative-unit based (`relative_uom_id`+`relative_factor`, no `category_id`);
+`account.tax` requires `tax_group_id`+`country_id` (borrowed from an existing tax so the
+new GST taxes stay selectable on this US-fiscal company). Company is still US/`generic_coa`
+with posted entries, so the India GST *chart* isn't loaded — the CGST/SGST split is modeled
+via hand-built group taxes, which is enough for dev. Prod note: pre-seed GST taxes as config
+and keep the agent to least-privilege (resolve-only) rather than granting accounting admin.
 
 **`post_customer_invoice`** (added 2026-07-14) — creates AND posts a customer
 invoice for an existing sale order, applying a payment term so the receivable gets

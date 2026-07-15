@@ -110,6 +110,25 @@ async def main():
             print(f"\nPASS: {pk['name']} done, FEFO picked {picked} "
                   f"(earliest expiry), qty {[mv['qty'] for mv in pk['moves']]}")
 
+            # ---- product master: HSN + GST split + lot/expiry + pack UoM ----
+            print("\n-- create_product (HSN + 18% GST split + lot/expiry + pack) --")
+            r = await session.call_tool("create_product",
+                                        {"name": "MCP Master Widget", "hsn": "3808",
+                                         "gst_rate": 18, "uom": "Units", "tracking": "lot",
+                                         "use_expiration": True,
+                                         "pack_name": "MCP Case of 12", "pack_size": 12})
+            prod = _content(r)
+            print(json.dumps(prod, indent=2, default=str))
+            assert prod.get("_ok"), f"create_product not ok: {prod}"
+            assert prod["l10n_in_hsn_code"] == "3808", prod
+            assert prod["tracking"] == "lot" and prod["use_expiration_date"], prod
+            comps = {c["name"] for c in prod["sales_taxes"][0]["components"]}
+            assert comps == {"CGST 9.0%", "SGST 9.0%"}, f"GST split wrong: {comps}"
+            assert prod["uom_ids"], f"pack UoM not linked: {prod}"
+            print(f"\nPASS: product #{prod['id']} '{prod['name']}' HSN {prod['l10n_in_hsn_code']}, "
+                  f"tax {prod['sales_taxes'][0]['name']} -> {sorted(comps)}, "
+                  f"tracking={prod['tracking']} expiry={prod['use_expiration_date']}")
+
 
 if __name__ == "__main__":
     asyncio.run(main())

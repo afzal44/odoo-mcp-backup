@@ -202,18 +202,24 @@ class FunctionalAgent:
             raise ValueError("No warehouse configured (is the 'stock' module installed?)")
         return wh[0]["lot_stock_id"][0]
 
+    def _ensure_fefo_category(self):
+        """Return the id of the FEFO-forced product category, creating it if absent.
+        Products filed here inherit removal strategy FEFO (earliest expiry ships first)."""
+        cat = self.c.search("product.category", [("name", "=", self.FEFO_CATEGORY)], limit=1)
+        if cat:
+            return cat[0]
+        fefo = self.c.search("product.removal", [("method", "=", "fefo")], limit=1)
+        return self.c.create("product.category",
+                             {"name": self.FEFO_CATEGORY,
+                              "removal_strategy_id": fefo[0] if fefo else False})
+
     def ensure_fefo_product(self, name, list_price=0.0, use_expiration=True):
         """Ensure a STORABLE, LOT-tracked product in the FEFO-forced category.
         Idempotent (matches by name). Returns product.product id. A product must be
         storable + tracking='lot' for lot/expiry delivery; the category forces FEFO."""
-        cat = self.c.search("product.category", [("name", "=", self.FEFO_CATEGORY)], limit=1)
-        if not cat:
-            fefo = self.c.search("product.removal", [("method", "=", "fefo")], limit=1)
-            cat = [self.c.create("product.category",
-                                 {"name": self.FEFO_CATEGORY,
-                                  "removal_strategy_id": fefo[0] if fefo else False})]
         vals = {"is_storable": True, "tracking": "lot",
-                "use_expiration_date": use_expiration, "categ_id": cat[0], "sale_ok": True}
+                "use_expiration_date": use_expiration,
+                "categ_id": self._ensure_fefo_category(), "sale_ok": True}
         found = self.c.search("product.product", [("name", "=", name)], limit=1)
         if found:
             self.c.write("product.product", found, vals)
@@ -336,6 +342,180 @@ class FunctionalAgent:
                                               if l["lot_id"] else None)}
                          for l in lines]
         return prec
+
+    # --- PRODUCT MASTER  (HSN + GST split + lot/expiry + UoM/pack) -----------
+    # Create a product.template the way an agro-distributor needs it: an HSN/SAC
+    # code, a GST rate that resolves to the correct tax objects (intra-state ->
+    # CGST+SGST group, inter-state -> IGST), optional lot tracking with expiry
+    # (auto-filed in the FEFO category so deliveries ship earliest-expiry first),
+    # a base UoM, and optional pack/case UoMs. Only intent goes in; Odoo computes
+    # the tax_string and we read the record back to verify what actually landed.
+    def _has_field(self, model, field):
+        try:
+            return field in self.c.execute_kw(model, "fields_get", [[field]],
+                                              {"attributes": ["type"]})
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _resolve_uom(self, uom):
+        """Resolve a uom.uom by id or name (exact, then contains). Returns id or None."""
+        if isinstance(uom, int):
+            return uom
+        found = self.c.search("uom.uom", [("name", "=", uom)], limit=1)
+        if not found:
+            found = self.c.search("uom.uom", [("name", "ilike", uom)], limit=1)
+        return found[0] if found else None
+
+    def _tax_defaults(self):
+        """Borrow the REQUIRED tax fields (company_id, country_id, tax_group_id)
+        from an existing tax so new GST taxes are valid AND selectable on this
+        company (the taxes_id domain filters by the company's fiscal country)."""
+        t = self.c.search_read("account.tax", [("type_tax_use", "in", ["sale", "purchase"])],
+                               ["company_id", "country_id", "tax_group_id"], limit=1)
+        if not t:
+            raise ValueError("No existing account.tax to borrow required fields from.")
+        d = t[0]
+        return {"company_id": d["company_id"][0], "country_id": d["country_id"][0],
+                "tax_group_id": d["tax_group_id"][0]}
+
+    def ensure_gst_tax(self, rate, type_tax_use="sale", interstate=False):
+        """Ensure a GST tax of `rate`% exists and return its id. Idempotent by name.
+
+        - intra-state (default): a GROUP tax expanding to CGST rate/2 + SGST rate/2,
+          so an invoice shows the split by component (matches l10n_in's structure).
+        - inter-state: a single IGST `rate`% tax.
+        Children are type_tax_use='none' (only used inside the group); the parent
+        group carries the sale/purchase usage."""
+        base = self._tax_defaults()
+        side = "Sales" if type_tax_use == "sale" else "Purchase"
+        # format numbers cleanly so 18 and 18.0 map to the same canonical tax name
+        r, h = f"{rate:g}", f"{rate / 2.0:g}"
+
+        def _get_or_create(name, vals, ttu):
+            found = self.c.search("account.tax",
+                                  [("name", "=", name), ("type_tax_use", "=", ttu)], limit=1)
+            if found:
+                return found[0]
+            return self.c.create("account.tax", {**base, "name": name,
+                                                 "type_tax_use": ttu, **vals})
+
+        if interstate:
+            return _get_or_create(f"IGST {r}% {side}",
+                                  {"amount": rate, "amount_type": "percent"}, type_tax_use)
+
+        half = rate / 2.0
+        cgst = _get_or_create(f"CGST {h}%", {"amount": half, "amount_type": "percent"}, "none")
+        sgst = _get_or_create(f"SGST {h}%", {"amount": half, "amount_type": "percent"}, "none")
+        return _get_or_create(f"GST {r}% (CGST+SGST) {side}",
+                              {"amount_type": "group",
+                               "children_tax_ids": [(6, 0, [cgst, sgst])]}, type_tax_use)
+
+    def ensure_pack_uom(self, name, contains, base_uom_id):
+        """Ensure a pack/case UoM that 'contains' N base units. Idempotent by name.
+        Odoo 19 uses relative units: relative_uom_id + relative_factor."""
+        found = self.c.search("uom.uom", [("name", "=", name)], limit=1)
+        if found:
+            return found[0]
+        return self.c.create("uom.uom", {"name": name,
+                                         "relative_uom_id": base_uom_id,
+                                         "relative_factor": contains})
+
+    def create_product(self, name, hsn=None, gst_rate=None, uom="Units",
+                       tracking=None, use_expiration=False, list_price=None,
+                       standard_price=None, category=None, pack=None,
+                       interstate_gst=False, sale_ok=True, purchase_ok=True):
+        """Create (or update, idempotent by name) a product.template.
+
+        name           : product name.
+        hsn            : HSN/SAC code (stored in l10n_in_hsn_code; needs l10n_in).
+        gst_rate       : GST % -> resolves sale & purchase taxes (CGST/SGST split,
+                         or IGST if interstate_gst=True). Omit to leave taxes alone.
+        uom            : base unit of measure name/id (default 'Units').
+        tracking       : 'lot' | 'serial' | 'none'. 'lot'/'serial' force storable.
+        use_expiration : enable expiry dates (perishable agro-inputs).
+        list_price / standard_price : sales price / cost. None = leave default (0).
+        category       : product.category name; defaults to the FEFO category when
+                         lot-tracked + expiry (so deliver_sale ships earliest expiry).
+        pack           : optional {'name': 'Case of 10', 'contains': 10} pack UoM.
+        Reads the record back and verifies name/uom/hsn/tax/tracking landed."""
+        vals = {"name": name, "sale_ok": sale_ok, "purchase_ok": purchase_ok}
+
+        uom_id = self._resolve_uom(uom) if uom else None
+        if uom_id:
+            vals["uom_id"] = uom_id
+
+        if tracking in ("lot", "serial"):
+            vals.update({"type": "consu", "is_storable": True, "tracking": tracking})
+        elif tracking == "none":
+            vals["tracking"] = "none"
+        if use_expiration:
+            vals["use_expiration_date"] = True
+
+        if category:
+            cat = self.c.search("product.category", [("name", "=", category)], limit=1)
+            if cat:
+                vals["categ_id"] = cat[0]
+        elif tracking == "lot" and use_expiration:
+            vals["categ_id"] = self._ensure_fefo_category()
+
+        if hsn is not None and self._has_field("product.template", "l10n_in_hsn_code"):
+            vals["l10n_in_hsn_code"] = str(hsn)
+
+        if gst_rate:
+            vals["taxes_id"] = [(6, 0, [self.ensure_gst_tax(gst_rate, "sale", interstate_gst)])]
+            vals["supplier_taxes_id"] = [(6, 0, [self.ensure_gst_tax(gst_rate, "purchase", interstate_gst)])]
+
+        if list_price is not None:
+            vals["list_price"] = list_price
+        if standard_price is not None:
+            vals["standard_price"] = standard_price
+
+        found = self.c.search("product.template", [("name", "=", name)], limit=1)
+        if found:
+            self.c.write("product.template", found, vals)
+            tid = found[0]
+        else:
+            tid = self.c.create("product.template", vals)
+
+        if pack:
+            puom = self.ensure_pack_uom(pack["name"], pack["contains"],
+                                        uom_id or self._resolve_uom("Units"))
+            cur = self.c.read("product.template", [tid], ["uom_ids"])[0]["uom_ids"]
+            self.c.write("product.template", [tid],
+                         {"uom_ids": [(6, 0, list({*cur, puom}))]})
+
+        summary = self._summarize_product(tid)
+        # verification: intent actually landed
+        summary["_ok"] = bool(
+            summary["name"] and summary.get("uom_id")
+            and (not gst_rate or summary["sales_taxes"])
+            and (hsn is None or not self._has_field("product.template", "l10n_in_hsn_code")
+                 or summary.get("l10n_in_hsn_code") == str(hsn))
+            and (tracking not in ("lot", "serial") or summary.get("tracking") == tracking))
+        return summary
+
+    def _summarize_product(self, tid):
+        fields = ["name", "default_code", "type", "is_storable", "tracking",
+                  "use_expiration_date", "uom_id", "uom_ids", "list_price",
+                  "standard_price", "categ_id", "taxes_id", "supplier_taxes_id", "tax_string"]
+        if self._has_field("product.template", "l10n_in_hsn_code"):
+            fields.append("l10n_in_hsn_code")
+        rec = self.c.read("product.template", [tid], fields)[0]
+        rec["id"] = tid
+
+        def _tax_detail(ids):
+            out = []
+            for t in self.c.read("account.tax", ids,
+                                 ["name", "amount", "amount_type", "children_tax_ids"]):
+                kids = (self.c.read("account.tax", t["children_tax_ids"], ["name", "amount"])
+                        if t["children_tax_ids"] else [])
+                out.append({"name": t["name"], "amount": t["amount"], "type": t["amount_type"],
+                            "components": [{"name": k["name"], "amount": k["amount"]} for k in kids]})
+            return out
+
+        rec["sales_taxes"] = _tax_detail(rec.get("taxes_id", []))
+        rec["purchase_taxes"] = _tax_detail(rec.get("supplier_taxes_id", []))
+        return rec
 
     # --- PURCHASE ------------------------------------------------------------
     def record_purchase(self, vendor, lines, confirm=False):

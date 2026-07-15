@@ -137,6 +137,41 @@ def deliver_sale(order: str, auto_confirm: bool = True) -> dict:
 
 
 # ============================================================================
+# CAPABILITY: product master  (HSN + GST split + lot/expiry + UoM/pack)  (added 2026-07-14)
+# ============================================================================
+@mcp.tool()
+def create_product(name: str, hsn: str | None = None, gst_rate: float | None = None,
+                   uom: str = "Units", tracking: str | None = None,
+                   use_expiration: bool = False, list_price: float | None = None,
+                   standard_price: float | None = None, category: str | None = None,
+                   pack_name: str | None = None, pack_size: float | None = None,
+                   interstate_gst: bool = False) -> dict:
+    """Create (or update, idempotent by name) a product master (product.template).
+
+    - name: product name (e.g. 'Amida 17.8% SL 250ml').
+    - hsn: HSN/SAC code (e.g. '3808'); stored in the l10n_in HSN field.
+    - gst_rate: GST percent (e.g. 18). Resolves BOTH a sales and a purchase tax:
+      intra-state -> a group tax that splits into CGST + SGST (each rate/2);
+      set interstate_gst=True for a single IGST tax instead. Omit to leave taxes unset.
+    - uom: base unit of measure name (default 'Units').
+    - tracking: 'lot', 'serial', or 'none'. 'lot'/'serial' make the product storable.
+    - use_expiration: enable expiry dates (perishable agro-inputs); with tracking='lot'
+      the product is filed in the FEFO category so deliveries ship earliest-expiry first.
+    - list_price / standard_price: sales price / cost (omit to leave the Odoo default).
+    - category: product.category name (defaults to the FEFO category for lot+expiry).
+    - pack_name + pack_size: optional pack/case UoM, e.g. ('Case of 10', 10).
+
+    Reads the record back and returns id, name, HSN, uom, tracking/expiry, category,
+    and the sales/purchase taxes with their CGST/SGST components. _ok is True only when
+    the requested HSN, tax, and tracking actually landed on the record."""
+    pack = {"name": pack_name, "contains": pack_size} if (pack_name and pack_size) else None
+    return _safe(lambda: agent().create_product(
+        name, hsn=hsn, gst_rate=gst_rate, uom=uom, tracking=tracking,
+        use_expiration=use_expiration, list_price=list_price, standard_price=standard_price,
+        category=category, pack=pack, interstate_gst=interstate_gst))
+
+
+# ============================================================================
 # CAPABILITY: lookups (read-only helpers so the agent can resolve names)
 # ============================================================================
 @mcp.tool()
