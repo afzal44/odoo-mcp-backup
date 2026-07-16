@@ -145,10 +145,14 @@ def create_product(name: str, hsn: str | None = None, gst_rate: float | None = N
                    use_expiration: bool = False, list_price: float | None = None,
                    standard_price: float | None = None, category: str | None = None,
                    pack_name: str | None = None, pack_size: float | None = None,
-                   interstate_gst: bool = False) -> dict:
+                   interstate_gst: bool = False,
+                   internal_reference: str | None = None, storable: bool = False) -> dict:
     """Create (or update, idempotent by name) a product master (product.template).
 
     - name: product name (e.g. 'Amida 17.8% SL 250ml').
+    - internal_reference: product code / default_code (e.g. 'AANDHI-1L').
+    - storable: track quantity on hand WITHOUT lot/serial (Track Inventory = True).
+      Ignored when tracking='lot'/'serial', which already force storable.
     - hsn: HSN/SAC code (e.g. '3808'); stored in the l10n_in HSN field.
     - gst_rate: GST percent (e.g. 18). Resolves BOTH a sales and a purchase tax:
       intra-state -> a group tax that splits into CGST + SGST (each rate/2);
@@ -168,7 +172,8 @@ def create_product(name: str, hsn: str | None = None, gst_rate: float | None = N
     return _safe(lambda: agent().create_product(
         name, hsn=hsn, gst_rate=gst_rate, uom=uom, tracking=tracking,
         use_expiration=use_expiration, list_price=list_price, standard_price=standard_price,
-        category=category, pack=pack, interstate_gst=interstate_gst))
+        category=category, pack=pack, interstate_gst=interstate_gst,
+        internal_reference=internal_reference, storable=storable))
 
 
 # ============================================================================

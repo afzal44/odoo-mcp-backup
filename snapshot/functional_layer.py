@@ -379,13 +379,33 @@ class FunctionalAgent:
                 "tax_group_id": d["tax_group_id"][0]}
 
     def ensure_gst_tax(self, rate, type_tax_use="sale", interstate=False):
-        """Ensure a GST tax of `rate`% exists and return its id. Idempotent by name.
+        """Resolve a GST tax of `rate`% and return its id.
 
-        - intra-state (default): a GROUP tax expanding to CGST rate/2 + SGST rate/2,
-          so an invoice shows the split by component (matches l10n_in's structure).
-        - inter-state: a single IGST `rate`% tax.
-        Children are type_tax_use='none' (only used inside the group); the parent
-        group carries the sale/purchase usage."""
+        Prefers the OFFICIAL India localization tax (l10n_in chart), which the
+        chart ships INACTIVE:
+          - intra-state (default): '{rate}% GST S|P' (group -> CGST + SGST),
+          - inter-state:           '{rate}% IGST S|P' (single IGST).
+        We activate the resolved tax (and its group children) so it becomes
+        selectable. Falls back to hand-building a CGST/SGST group (or IGST) tax
+        when the India chart isn't present (e.g. a generic_coa company)."""
+        suffix = "S" if type_tax_use == "sale" else "P"
+        r = f"{rate:g}"
+        official = f"{r}% {'IGST' if interstate else 'GST'} {suffix}"
+        found = self.c.search("account.tax",
+                              [("name", "=", official), ("type_tax_use", "=", type_tax_use)],
+                              context={"active_test": False}, limit=1)
+        if found:
+            tax = self.c.read("account.tax", found, ["active", "children_tax_ids"])[0]
+            to_activate = ([] if tax.get("active") else [found[0]])
+            kids = tax.get("children_tax_ids") or []
+            if kids:
+                to_activate += [k["id"] for k in self.c.read("account.tax", kids, ["active"])
+                                if not k.get("active")]
+            if to_activate:
+                self.c.write("account.tax", to_activate, {"active": True})
+            return found[0]
+
+        # ---- fallback: hand-build (company without the India GST chart) ----
         base = self._tax_defaults()
         side = "Sales" if type_tax_use == "sale" else "Purchase"
         # format numbers cleanly so 18 and 18.0 map to the same canonical tax name
@@ -423,10 +443,14 @@ class FunctionalAgent:
     def create_product(self, name, hsn=None, gst_rate=None, uom="Units",
                        tracking=None, use_expiration=False, list_price=None,
                        standard_price=None, category=None, pack=None,
-                       interstate_gst=False, sale_ok=True, purchase_ok=True):
+                       interstate_gst=False, sale_ok=True, purchase_ok=True,
+                       internal_reference=None, storable=False):
         """Create (or update, idempotent by name) a product.template.
 
         name           : product name.
+        internal_reference : product code (default_code), e.g. 'AANDHI-1L'.
+        storable       : track quantity on hand (is_storable) WITHOUT lot/serial.
+                         Ignored when tracking='lot'/'serial' (those force storable).
         hsn            : HSN/SAC code (stored in l10n_in_hsn_code; needs l10n_in).
         gst_rate       : GST % -> resolves sale & purchase taxes (CGST/SGST split,
                          or IGST if interstate_gst=True). Omit to leave taxes alone.
@@ -444,10 +468,15 @@ class FunctionalAgent:
         if uom_id:
             vals["uom_id"] = uom_id
 
+        if internal_reference is not None:
+            vals["default_code"] = str(internal_reference)
+
         if tracking in ("lot", "serial"):
             vals.update({"type": "consu", "is_storable": True, "tracking": tracking})
         elif tracking == "none":
             vals["tracking"] = "none"
+        if storable and tracking not in ("lot", "serial"):
+            vals.update({"type": "consu", "is_storable": True})
         if use_expiration:
             vals["use_expiration_date"] = True
 
@@ -491,7 +520,9 @@ class FunctionalAgent:
             and (not gst_rate or summary["sales_taxes"])
             and (hsn is None or not self._has_field("product.template", "l10n_in_hsn_code")
                  or summary.get("l10n_in_hsn_code") == str(hsn))
-            and (tracking not in ("lot", "serial") or summary.get("tracking") == tracking))
+            and (tracking not in ("lot", "serial") or summary.get("tracking") == tracking)
+            and (internal_reference is None or summary.get("default_code") == str(internal_reference))
+            and (not storable or summary.get("is_storable")))
         return summary
 
     def _summarize_product(self, tid):
