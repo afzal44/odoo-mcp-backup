@@ -45,3 +45,10 @@
 ==> [3/4] HARD GATE: scanning snapshot for secrets
     clean (no secrets, no binaries).
 ==> [4/4] Commit
+    committed.
+    pushed.
+==> [1/4] Reset snapshot
+==> [2/4] Staging MCP source (text/code allowlist)
+==> [3/4] HARD GATE: scanning snapshot for secrets
+    clean (no secrets, no binaries).
+==> [4/4] Commit
